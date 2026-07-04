@@ -1,0 +1,17 @@
+# Generated outputs
+*.msh
+*.html
+*.step
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter / OCP-VSCode checkpoints
+.ipynb_checkpoints/
+
+# Editor
+.vscode/
+*.swp
