@@ -35,7 +35,8 @@ ETYPE_QUAD = 3   # 4-node quadrangle  (→ CQUAD4 in Nastran)
 # Reusable meshing function (called by face_labeler.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_mesh(step_file: str, face_labels: dict, mesh_file: str) -> None:
+def run_mesh(step_file: str, face_labels: dict, mesh_file: str,
+             mesh_size_max: float = 3.0, mesh_size_min: float | None = None) -> None:
     """
     Import a STEP file, create Gmsh physical groups from face_labels, generate
     a quad-dominant mesh, and write it to mesh_file.
@@ -79,10 +80,12 @@ def run_mesh(step_file: str, face_labels: dict, mesh_file: str) -> None:
         gmsh.model.addPhysicalGroup(2, [tag], name=f"surf_{tag}")
 
     # Quad-dominant mesh settings
+    if mesh_size_min is None:
+        mesh_size_min = mesh_size_max * 0.4
     gmsh.option.setNumber("Mesh.Algorithm",               8)  # Frontal-Delaunay for quads
     gmsh.option.setNumber("Mesh.RecombineAll",            1)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthMin", 2.0)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", 3.0)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size_min)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size_max)
 
     gmsh.model.mesh.generate(2)
     gmsh.model.mesh.recombine()

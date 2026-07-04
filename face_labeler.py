@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
 """
-face_labeler.py — browser GUI for STEP face selection and group labeling.
+face_labeler.py — integrated STEP labeler + Gmsh mesher + mesh viewer.
 
 Usage:
     conda run -n meshcad python face_labeler.py part.step
 
-Then open http://localhost:8080 in your browser.
+Phases:
+  label  →  select surfaces, assign groups, set mesh size, run mesh
+  view   →  inspect quad mesh colored by group; click Edit Labels to iterate
 
-Workflow:
-  1. Each surface is labeled with its Gmsh surface tag (number) in the 3D view.
-  2. Click the matching chip in the right panel to select a surface.
-     The selected surface highlights yellow in the 3D view.
-  3. Click Include to add it to the mesh, Exclude to remove it.
-  4. Type a group name and click Assign — the surface joins that group.
-     Group names become Gmsh physical surfaces → Nastran PSHELL regions.
-  5. Repeat for all surfaces of interest.
-  6. Click Export JSON to save <stem>_labels.json.
-  7. Click Run Mesh to generate the quad mesh via Gmsh.
-
-Color legend:
-  Grey   = excluded (no mesh elements in output)
+Color legend (label phase):
+  Grey   = excluded (no mesh elements)
   White  = included, not yet assigned to a group
   Yellow = currently selected
   Color  = assigned to a named group (distinct color per group)
@@ -32,21 +23,22 @@ from pathlib import Path
 
 import numpy as np
 import gmsh
+import meshio
 import pyvista as pv
 from pyvista.trame.ui import plotter_ui
 from trame.app import get_server
 from trame.ui.vuetify3 import SinglePageLayout
 from trame.widgets import vuetify3 as v, html
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description="Interactive STEP face labeler")
+parser = argparse.ArgumentParser(description="Integrated STEP face labeler + mesher")
 parser.add_argument("step_file", help="Path to STEP file")
 args = parser.parse_args()
 
 STEP_PATH = Path(args.step_file).resolve()
 JSON_PATH = STEP_PATH.with_name(STEP_PATH.stem + "_labels.json")
+MESH_FILE = str(STEP_PATH.with_suffix(".msh"))
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 C_EXCLUDED = (0.55, 0.55, 0.55)
@@ -55,15 +47,14 @@ C_SELECTED = (1.00, 0.82, 0.00)
 
 _cmap = plt.get_cmap("tab10")
 
+
 def group_color_rgb(idx: int) -> tuple:
     return tuple(float(c) for c in _cmap(idx % 10)[:3])
 
-def rgb_to_hex(r, g, b) -> str:
-    return "#{:02x}{:02x}{:02x}".format(int(r*255), int(g*255), int(b*255))
 
-C_EXCLUDED_HEX = rgb_to_hex(*C_EXCLUDED)
-C_INCLUDED_HEX = rgb_to_hex(*C_INCLUDED)
-C_SELECTED_HEX = rgb_to_hex(*C_SELECTED)
+def rgb_to_hex(r, g, b) -> str:
+    return "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
+
 
 # ── Load STEP + tessellate via Gmsh ───────────────────────────────────────────
 print(f"\nLoading {STEP_PATH.name} ...")
@@ -77,7 +68,7 @@ surfaces  = gmsh.model.getEntities(dim=2)
 surf_tags = [t for _, t in surfaces]
 
 bb      = gmsh.model.getBoundingBox(-1, -1)
-bb_diag = ((bb[3]-bb[0])**2 + (bb[4]-bb[1])**2 + (bb[5]-bb[2])**2) ** 0.5
+bb_diag = ((bb[3] - bb[0])**2 + (bb[4] - bb[1])**2 + (bb[5] - bb[2])**2) ** 0.5
 mesh_sz = max(bb_diag / 12, 0.5)
 
 face_info: dict[int, dict] = {}
@@ -123,8 +114,8 @@ for _, surf_tag in surfaces:
     if not tris:
         continue
 
-    tris = np.array(tris, dtype=np.int64)
-    n    = len(tris)
+    tris  = np.array(tris, dtype=np.int64)
+    n     = len(tris)
     cells = np.empty(n * 4, dtype=np.int64)
     cells[0::4] = 3
     cells[1::4] = tris[:, 0]
@@ -147,6 +138,7 @@ state, ctrl = server.state, server.controller
 pl = pv.Plotter()
 pl.set_background("white")
 
+# Tessellation actors (label phase)
 actors: dict[int, pv.Actor] = {}
 for surf_tag, grid in face_grids.items():
     actor = pl.add_mesh(
@@ -160,14 +152,12 @@ for surf_tag, grid in face_grids.items():
     )
     actors[surf_tag] = actor
 
-# Centroid labels in the 3D view so users can match chips to faces
-centroid_pts = np.array(
-    [face_info[t]["centroid_xyz"] for t in sorted(face_grids.keys())]
-)
-centroid_labels = [str(t) for t in sorted(face_grids.keys())]
-pl.add_point_labels(
+# Centroid number labels (label phase)
+centroid_pts  = np.array([face_info[t]["centroid_xyz"] for t in sorted(face_grids)])
+centroid_strs = [str(t) for t in sorted(face_grids)]
+label_actor   = pl.add_point_labels(
     centroid_pts,
-    centroid_labels,
+    centroid_strs,
     font_size=14,
     point_size=1,
     bold=True,
@@ -179,7 +169,11 @@ pl.add_point_labels(
 
 pl.camera_position = "iso"
 
+# Mesh actors (view phase) — populated after first Run Mesh
+mesh_actors: list = []
+
 # ── App state ─────────────────────────────────────────────────────────────────
+state.app_phase       = "label"             # "label" | "view"
 state.selected_surf   = None
 state.included        = []
 state.groups          = {}
@@ -193,9 +187,14 @@ state.group_summary   = []
 state.status_msg      = "Click a surface chip to select it"
 state.has_selection   = False
 state.has_groups      = False
-state.surf_chips      = []   # [{tag, label, color_hex, text_color}]
+state.surf_chips      = []
+state.mesh_size       = round(mesh_sz, 1)
+state.mesh_stats      = ""
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+_SLIDER_MAX = round(bb_diag / 3, 1)
+_SLIDER_MIN = 0.5
+
+# ── Label-phase helpers ───────────────────────────────────────────────────────
 def _find_group(surf_tag: int) -> str | None:
     for name, tags in state.groups.items():
         if surf_tag in tags:
@@ -207,7 +206,8 @@ def _face_color_rgb(surf_tag: int) -> tuple:
     group_names = list(state.groups.keys())
     if surf_tag == state.selected_surf:
         return C_SELECTED
-    if (grp := _find_group(surf_tag)) is not None:
+    grp = _find_group(surf_tag)
+    if grp is not None:
         return group_color_rgb(group_names.index(grp))
     if surf_tag in state.included:
         return C_INCLUDED
@@ -216,21 +216,25 @@ def _face_color_rgb(surf_tag: int) -> tuple:
 
 def _build_chips() -> list:
     chips = []
-    for tag in sorted(face_grids.keys()):
+    for tag in sorted(face_grids):
         rgb = _face_color_rgb(tag)
         hex_color = rgb_to_hex(*rgb)
-        luminance = 0.299*rgb[0] + 0.587*rgb[1] + 0.114*rgb[2]
+        luminance = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
         text_color = "#000000" if luminance > 0.55 else "#ffffff"
-        status = ""
+        grp = _find_group(tag)
         if tag == state.selected_surf:
-            status = " ★"
-        elif (grp := _find_group(tag)):
-            status = f" [{grp}]"
+            suffix = " ★"
+        elif grp:
+            suffix = f" [{grp}]"
         elif tag in state.included:
-            status = " ✓"
+            suffix = " ✓"
+        else:
+            suffix = ""
         chips.append({
-            "tag": tag, "label": f"Surf {tag}{status}",
-            "color": hex_color, "text_color": text_color,
+            "tag":        tag,
+            "label":      f"Surf {tag}{suffix}",
+            "color":      hex_color,
+            "text_color": text_color,
         })
     return chips
 
@@ -266,14 +270,88 @@ def _update_sel_display(surf_tag: int):
     state.sel_status    = status
     state.has_selection = True
 
-# ── Surface chip click handler ────────────────────────────────────────────────
+# ── Phase visibility toggles ──────────────────────────────────────────────────
+def _set_tess_visible(on: bool):
+    for actor in actors.values():
+        actor.SetVisibility(on)
+    try:
+        label_actor.SetVisibility(on)
+    except Exception:
+        pass
+
+
+def _set_mesh_visible(on: bool):
+    for actor in mesh_actors:
+        actor.SetVisibility(on)
+
+# ── Mesh-actor builder ────────────────────────────────────────────────────────
+def _build_mesh_actors(mesh_file: str, group_order: list) -> tuple:
+    mesh = meshio.read(mesh_file)
+    tag_to_name = {
+        int(v[0]): name
+        for name, v in mesh.field_data.items()
+        if v[1] == 2
+    }
+    phys_tags = mesh.cell_data.get("gmsh:physical", [])
+    quad_conn, quad_label = [], []
+    for block, cell_tags in zip(mesh.cells, phys_tags):
+        if block.type != "quad":
+            continue
+        for row, tag in zip(block.data, cell_tags):
+            quad_conn.append(row)
+            quad_label.append(int(tag))
+
+    if not quad_conn:
+        return [], "No quad elements found"
+
+    quad_conn  = np.array(quad_conn,  dtype=np.int64)
+    quad_label = np.array(quad_label, dtype=np.int32)
+    points     = mesh.points[:, :3]
+
+    VTK_QUAD = 9
+    n     = len(quad_conn)
+    cells = np.empty(n * 5, dtype=np.int64)
+    cells[0::5] = 4
+    cells[1::5] = quad_conn[:, 0]
+    cells[2::5] = quad_conn[:, 1]
+    cells[3::5] = quad_conn[:, 2]
+    cells[4::5] = quad_conn[:, 3]
+
+    grid = pv.UnstructuredGrid(cells, np.full(n, VTK_QUAD, dtype=np.uint8), points)
+    grid.cell_data["region_id"] = quad_label
+
+    new_actors = []
+    for tag in np.unique(quad_label):
+        name = tag_to_name.get(int(tag), f"tag_{tag}")
+        try:
+            idx = group_order.index(name)
+        except ValueError:
+            idx = int(tag) % 10
+        color_rgb = group_color_rgb(idx)
+        color_255 = [int(c * 255) for c in color_rgb]
+        subset = grid.extract_cells(quad_label == tag)
+        actor  = pl.add_mesh(
+            subset,
+            color=color_255,
+            show_edges=True,
+            edge_color="black",
+            line_width=1.0,
+            show_scalar_bar=False,
+        )
+        actor.SetVisibility(False)  # shown only in view phase
+        new_actors.append(actor)
+
+    stats = f"{len(quad_conn)} quads  ·  {len(np.unique(quad_label))} regions"
+    return new_actors, stats
+
+# ── Callbacks ─────────────────────────────────────────────────────────────────
 def select_surf(tag, **kwargs):
     surf_tag = int(tag)
     state.selected_surf = surf_tag
     _update_sel_display(surf_tag)
     _refresh_colors()
 
-# ── Button handlers ───────────────────────────────────────────────────────────
+
 def include_face():
     tag = state.selected_surf
     if tag is None:
@@ -287,7 +365,7 @@ def include_face():
 def exclude_face():
     tag = state.selected_surf
     if tag is None:
-            return
+        return
     state.included = [t for t in state.included if t != tag]
     state.groups = {
         name: [t for t in tags if t != tag]
@@ -329,31 +407,64 @@ def export_json():
 
 
 def run_mesh_action():
+    global mesh_actors
     if not state.groups:
         state.status_msg = "Assign at least one group before meshing."
         return
+
     sys.path.insert(0, str(Path(__file__).parent))
     from step1_tag_mesh import run_mesh
+
     data = {
         "included": list(state.included),
         "groups":   {name: list(tags) for name, tags in state.groups.items()},
     }
-    mesh_file = str(STEP_PATH.with_suffix(".msh"))
+    group_order = list(state.groups.keys())
+    mesh_size   = float(state.mesh_size)
     state.status_msg = "Meshing…"
-    try:
-        run_mesh(str(STEP_PATH), data, mesh_file)
-        state.status_msg = f"Mesh written → {STEP_PATH.stem}.msh"
-    except Exception as e:
-        state.status_msg = f"Error: {e}"
 
-# ── Pre-populate chips (no view_update yet — view isn't built) ────────────────
+    try:
+        run_mesh(str(STEP_PATH), data, MESH_FILE,
+                 mesh_size_max=mesh_size,
+                 mesh_size_min=mesh_size * 0.4)
+    except Exception as e:
+        state.status_msg = f"Mesh failed: {e}"
+        import traceback; traceback.print_exc()
+        return
+
+    # Replace mesh actors
+    for actor in mesh_actors:
+        pl.remove_actor(actor)
+    mesh_actors = []
+
+    mesh_actors, stats = _build_mesh_actors(MESH_FILE, group_order)
+    state.mesh_stats = stats
+
+    _set_tess_visible(False)
+    _set_mesh_visible(True)
+    state.app_phase  = "view"
+    state.status_msg = f"Done: {stats}"
+    ctrl.view_update()
+
+
+def edit_labels():
+    _set_mesh_visible(False)
+    _set_tess_visible(True)
+    state.app_phase  = "label"
+    state.status_msg = "Edit groups, then Run Mesh again."
+    ctrl.view_update()
+
+# ── Pre-populate chips before layout ─────────────────────────────────────────
 state.surf_chips = _build_chips()
 
 # ── trame layout ──────────────────────────────────────────────────────────────
 PANEL_BG = "background:#fafafa; border-left:1px solid #e0e0e0; height:100%; overflow-y:auto"
+HDR      = "font-weight:600; font-size:0.85em; margin-bottom:6px"
+SMALL    = "font-size:0.78em; margin:2px 0; color:#444"
+MONO     = "font-size:0.80em; padding:2px 0; font-family:monospace; color:#333"
 
 with SinglePageLayout(server) as layout:
-    layout.title.set_text("Face Labeler")
+    layout.title.set_text("Meshifier")
     layout.icon.hide()
 
     with layout.toolbar:
@@ -375,101 +486,174 @@ with SinglePageLayout(server) as layout:
                 # ── Right panel ────────────────────────────────────────────
                 with v.VCol(cols=3, classes="pa-3", style=PANEL_BG):
 
-                    # Surface chips
-                    html.P("Surfaces  (click to select)",
-                           style="font-weight:600; font-size:0.85em; margin-bottom:6px")
-                    with html.Div(style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px"):
-                        v.VChip(
-                            "{{ chip.label }}",
-                            v_for="chip in surf_chips",
-                            key=("chip.tag",),
-                            style=("'background:' + chip.color + '; color:' + chip.text_color + "
-                                   "'; cursor:pointer; font-size:0.78em'",),
-                            size="small",
-                            click=(select_surf, "[chip.tag]"),
+                    # ═══════════ LABEL PHASE ════════════════════════════════
+                    with html.Div(v_if="app_phase === 'label'"):
+
+                        # Surface chips
+                        html.P("Surfaces  (click to select)", style=HDR)
+                        with html.Div(
+                            style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px"
+                        ):
+                            v.VChip(
+                                "{{ chip.label }}",
+                                v_for="chip in surf_chips",
+                                key=("chip.tag",),
+                                style=(
+                                    "'background:' + chip.color + '; color:' + chip.text_color"
+                                    " + '; cursor:pointer; font-size:0.78em'",
+                                ),
+                                size="small",
+                                click=(select_surf, "[chip.tag]"),
+                            )
+
+                        v.VDivider(classes="mb-3")
+
+                        # Selected face info
+                        html.P("Selected face", style=HDR)
+                        with v.VCard(variant="outlined", classes="mb-2"):
+                            with v.VCardText(classes="pa-2"):
+                                with html.Div(v_if="has_selection"):
+                                    html.P(
+                                        "{{ sel_surf_text }}",
+                                        style="font-weight:bold; margin:0 0 4px 0; font-size:0.9em",
+                                    )
+                                    html.P("Centroid: {{ sel_centroid }}", style=SMALL)
+                                    html.P("Area: {{ sel_area }}", style=SMALL)
+                                    html.P("Status: {{ sel_status }}", style=SMALL + "; font-style:italic")
+                                with html.Div(v_if="!has_selection"):
+                                    html.P(
+                                        "Click a surface chip above",
+                                        style="color:#aaa; font-size:0.82em; margin:0; font-style:italic",
+                                    )
+
+                        # Include / Exclude
+                        with v.VRow(no_gutters=True, classes="mb-3"):
+                            with v.VCol(cols=6, classes="pr-1"):
+                                v.VBtn(
+                                    "Include", block=True, color="primary",
+                                    variant="outlined", size="small",
+                                    disabled=("!has_selection",),
+                                    click=include_face,
+                                )
+                            with v.VCol(cols=6, classes="pl-1"):
+                                v.VBtn(
+                                    "Exclude", block=True, color="error",
+                                    variant="outlined", size="small",
+                                    disabled=("!has_selection",),
+                                    click=exclude_face,
+                                )
+
+                        v.VDivider(classes="mb-3")
+
+                        # Group assignment
+                        html.P("Assign to group", style=HDR)
+                        v.VCombobox(
+                            v_model=("group_input", ""),
+                            label="Group name",
+                            items=("existing_groups", []),
+                            density="compact",
+                            hide_details=True,
+                            classes="mb-2",
+                        )
+                        v.VBtn(
+                            "Assign to group", block=True, color="success",
+                            variant="tonal", size="small", classes="mb-3",
+                            disabled=("!has_selection || !group_input",),
+                            click=assign_group,
                         )
 
-                    v.VDivider(classes="mb-3")
+                        v.VDivider(classes="mb-3")
 
-                    # Selected face info
-                    html.P("Selected face",
-                           style="font-weight:600; font-size:0.85em; margin-bottom:6px")
-                    with v.VCard(variant="outlined", classes="mb-2"):
-                        with v.VCardText(classes="pa-2"):
-                            with html.Div(v_if="has_selection"):
-                                html.P("{{ sel_surf_text }}",
-                                       style="font-weight:bold; margin:0 0 4px 0; font-size:0.9em")
-                                html.P("Centroid: {{ sel_centroid }}",
-                                       style="font-size:0.78em; margin:2px 0; color:#444")
-                                html.P("Area: {{ sel_area }}",
-                                       style="font-size:0.78em; margin:2px 0; color:#444")
-                                html.P("Status: {{ sel_status }}",
-                                       style="font-size:0.78em; margin:2px 0; color:#444; font-style:italic")
-                            with html.Div(v_if="!has_selection"):
-                                html.P("Click a surface chip above",
-                                       style="color:#aaa; font-size:0.82em; margin:0; font-style:italic")
+                        # Group summary
+                        html.P("Groups", style=HDR)
+                        with html.Div(v_if="!has_groups"):
+                            html.P(
+                                "No groups assigned yet",
+                                style="color:#aaa; font-size:0.82em; font-style:italic",
+                            )
+                        with html.Div(v_if="has_groups"):
+                            with html.Div(
+                                v_for="line in group_summary",
+                                key="line",
+                                style=MONO,
+                            ):
+                                html.Span("● {{ line }}")
 
-                    # Include / Exclude
-                    with v.VRow(no_gutters=True, classes="mb-3"):
-                        with v.VCol(cols=6, classes="pr-1"):
-                            v.VBtn("Include", block=True, color="primary",
-                                   variant="outlined", size="small",
-                                   disabled=("!has_selection",),
-                                   click=include_face)
-                        with v.VCol(cols=6, classes="pl-1"):
-                            v.VBtn("Exclude", block=True, color="error",
-                                   variant="outlined", size="small",
-                                   disabled=("!has_selection",),
-                                   click=exclude_face)
+                        v.VDivider(classes="my-3")
 
-                    v.VDivider(classes="mb-3")
+                        # Mesh element size slider
+                        html.P("Element size", style=HDR)
+                        v.VSlider(
+                            v_model=("mesh_size", round(mesh_sz, 1)),
+                            min=_SLIDER_MIN,
+                            max=_SLIDER_MAX,
+                            step=0.5,
+                            thumb_label=True,
+                            color="secondary",
+                            hide_details=True,
+                            classes="mb-3",
+                        )
 
-                    # Group assignment
-                    html.P("Assign to group",
-                           style="font-weight:600; font-size:0.85em; margin-bottom:6px")
-                    v.VCombobox(
-                        v_model=("group_input", ""),
-                        label="Group name",
-                        items=("existing_groups", []),
-                        density="compact",
-                        hide_details=True,
-                        classes="mb-2",
-                    )
-                    v.VBtn("Assign to group", block=True, color="success",
-                           variant="tonal", size="small", classes="mb-3",
-                           disabled=("!has_selection || !group_input",),
-                           click=assign_group)
+                        # Export / Mesh
+                        v.VBtn(
+                            "Export JSON", block=True, color="primary",
+                            variant="tonal", classes="mb-2",
+                            disabled=("!has_groups",),
+                            click=export_json,
+                        )
+                        v.VBtn(
+                            "Run Mesh", block=True, color="secondary",
+                            variant="tonal", classes="mb-2",
+                            disabled=("!has_groups",),
+                            click=run_mesh_action,
+                        )
 
-                    v.VDivider(classes="mb-3")
+                        html.P(
+                            "{{ status_msg }}",
+                            style="font-size:0.78em; color:#555; margin-top:6px; min-height:1.2em",
+                        )
 
-                    # Group summary
-                    html.P("Groups",
-                           style="font-weight:600; font-size:0.85em; margin-bottom:4px")
-                    with html.Div(v_if="!has_groups"):
-                        html.P("No groups assigned yet",
-                               style="color:#aaa; font-size:0.82em; font-style:italic")
-                    with html.Div(v_if="has_groups"):
+                    # ═══════════ VIEW PHASE ══════════════════════════════════
+                    with html.Div(v_if="app_phase === 'view'"):
+
+                        html.P("Mesh result", style=HDR)
+                        with v.VCard(variant="outlined", classes="mb-3"):
+                            with v.VCardText(classes="pa-2"):
+                                html.P(
+                                    "{{ mesh_stats }}",
+                                    style="font-size:0.85em; font-family:monospace; margin:0",
+                                )
+
+                        html.P("Groups", style=HDR)
                         with html.Div(
                             v_for="line in group_summary",
                             key="line",
-                            style="font-size:0.80em; padding:2px 0; font-family:monospace; color:#333",
+                            style=MONO + "; margin-bottom:2px",
                         ):
                             html.Span("● {{ line }}")
 
-                    v.VDivider(classes="my-3")
+                        v.VDivider(classes="my-3")
 
-                    # Export / Mesh
-                    v.VBtn("Export JSON", block=True, color="primary", variant="tonal",
-                           classes="mb-2",
-                           disabled=("!has_groups",),
-                           click=export_json)
-                    v.VBtn("Run Mesh", block=True, color="secondary", variant="tonal",
-                           classes="mb-2",
-                           disabled=("!has_groups",),
-                           click=run_mesh_action)
+                        v.VBtn(
+                            "Edit Labels", block=True, color="primary",
+                            variant="tonal", classes="mb-2",
+                            click=edit_labels,
+                        )
+                        v.VBtn(
+                            "Re-mesh", block=True, color="secondary",
+                            variant="outlined", classes="mb-2",
+                            click=run_mesh_action,
+                        )
+                        v.VBtn(
+                            "Export JSON", block=True, color="default",
+                            variant="outlined", classes="mb-2",
+                            click=export_json,
+                        )
 
-                    html.P("{{ status_msg }}",
-                           style="font-size:0.78em; color:#555; margin-top:6px; min-height:1.2em")
+                        html.P(
+                            "{{ status_msg }}",
+                            style="font-size:0.78em; color:#555; margin-top:6px; min-height:1.2em",
+                        )
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
