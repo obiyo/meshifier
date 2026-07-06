@@ -133,6 +133,19 @@ Note: `adj[1]` is the downward adjacency (endpoint vertices, always 2 for a line
 
 ---
 
+### 18. `render_lines_as_tubes=True` required for line elements in trame
+
+VTK.js (the browser-side renderer used by trame) does **not** render `VTK_LINE` cells (cell type 3) in an `UnstructuredGrid` unless `render_lines_as_tubes=True` is set on the actor.  Without it, the actor is created, added to the plotter, and made visible — but nothing appears in the browser.  No error or warning is raised.
+
+**Fix:** always pass `render_lines_as_tubes=True` when adding a mesh of 1D bar elements:
+```python
+actor = pl.add_mesh(line_grid, color=..., line_width=4.0, render_lines_as_tubes=True)
+```
+
+Note: `render_points_as_spheres=True` is the analogous flag for 0D vertex elements and has the same effect on VTK.js visibility.
+
+---
+
 ### 15. meshio cell type names for 0D / 1D elements
 
 After reading a `.msh` file with meshio, lower-dimensional elements appear as:
