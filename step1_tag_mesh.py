@@ -59,8 +59,12 @@ def run_mesh(step_file: str, face_labels: dict, mesh_file: str,
     belong to a physical group are exported to the .msh file.  "Excluded"
     surfaces (absent from "included") are meshed internally but not exported.
     """
-    included = set(face_labels.get("included", []))
-    groups   = face_labels.get("groups", {})
+    included      = set(face_labels.get("included",      []))
+    groups        = face_labels.get("groups",        {})
+    edge_included = set(face_labels.get("edge_included", []))
+    edge_groups   = face_labels.get("edge_groups",   {})
+    vert_included = set(face_labels.get("vert_included", []))
+    vert_groups   = face_labels.get("vert_groups",   {})
 
     gmsh.initialize()
     gmsh.option.setNumber("General.Verbosity", 2)
@@ -79,6 +83,26 @@ def run_mesh(step_file: str, face_labels: dict, mesh_file: str,
     # Included-but-unassigned surfaces get a fallback group so they export
     for tag in sorted(included - assigned):
         gmsh.model.addPhysicalGroup(2, [tag], name=f"surf_{tag}")
+
+    # 1D physical groups (edges / bar elements)
+    edge_assigned: set[int] = set()
+    for name, tags in edge_groups.items():
+        valid = [t for t in tags if t in edge_included]
+        if valid:
+            gmsh.model.addPhysicalGroup(1, valid, name=name)
+            edge_assigned.update(valid)
+    for tag in sorted(edge_included - edge_assigned):
+        gmsh.model.addPhysicalGroup(1, [tag], name=f"edge_{tag}")
+
+    # 0D physical groups (vertices / point elements)
+    vert_assigned: set[int] = set()
+    for name, tags in vert_groups.items():
+        valid = [t for t in tags if t in vert_included]
+        if valid:
+            gmsh.model.addPhysicalGroup(0, valid, name=name)
+            vert_assigned.update(valid)
+    for tag in sorted(vert_included - vert_assigned):
+        gmsh.model.addPhysicalGroup(0, [tag], name=f"vert_{tag}")
 
     # Mesh settings
     if mesh_size_min is None:

@@ -87,3 +87,33 @@ Even without a display, EGL, or OSMesa, `export_html()` succeeds. VTK prints war
 Under the hood `pl.export_html()` imports `panel` to embed the VTK.js viewer. Without it you get `ModuleNotFoundError: No module named 'panel'`.
 
 **Fix:** `pip install panel`
+
+---
+
+## 0D / 1D elements
+
+### 13. `getCenterOfMass(0, tag)` returns (0, 0, 0) for all vertices
+
+`gmsh.model.occ.getCenterOfMass(dim, tag)` works correctly for dim=1, 2, 3 but silently returns the origin for dim=0 (vertices) in the OCC kernel.
+
+**Fix:** Use `gmsh.model.getBoundingBox(0, tag)` — for a vertex the bounding box min and max are identical and equal to the vertex coordinates:
+```python
+bb = gmsh.model.getBoundingBox(0, tag)
+x, y, z = bb[0], bb[1], bb[2]
+```
+
+---
+
+### 14. `generate(2)` creates 0D and 1D elements automatically
+
+`gmsh.model.mesh.generate(2)` generates mesh for all dimensions ≤ 2, including point elements at vertices (dim=0) and line elements on curves (dim=1). No separate `generate(0)` or `generate(1)` calls are needed. Physical groups at each dimension control which entities are exported to the `.msh` file.
+
+---
+
+### 15. meshio cell type names for 0D / 1D elements
+
+After reading a `.msh` file with meshio, lower-dimensional elements appear as:
+- `"vertex"` — 1-node point element (Gmsh type 15, → Nastran CONM2/CELAS)
+- `"line"` — 2-node bar element (Gmsh type 1, → Nastran CBAR/CBEAM)
+
+Both are present in `mesh.cells` only when they belong to a named physical group.
