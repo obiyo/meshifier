@@ -36,7 +36,8 @@ ETYPE_QUAD = 3   # 4-node quadrangle  (→ CQUAD4 in Nastran)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_mesh(step_file: str, face_labels: dict, mesh_file: str,
-             mesh_size_max: float = 3.0, mesh_size_min: float | None = None) -> None:
+             mesh_size_max: float = 3.0, mesh_size_min: float | None = None,
+             mesh_types: dict | None = None) -> None:
     """
     Import a STEP file, create Gmsh physical groups from face_labels, generate
     a quad-dominant mesh, and write it to mesh_file.
@@ -79,13 +80,40 @@ def run_mesh(step_file: str, face_labels: dict, mesh_file: str,
     for tag in sorted(included - assigned):
         gmsh.model.addPhysicalGroup(2, [tag], name=f"surf_{tag}")
 
-    # Quad-dominant mesh settings
+    # Mesh settings
     if mesh_size_min is None:
         mesh_size_min = mesh_size_max * 0.4
-    gmsh.option.setNumber("Mesh.Algorithm",               8)  # Frontal-Delaunay for quads
-    gmsh.option.setNumber("Mesh.RecombineAll",            1)
+    if mesh_types is None:
+        mesh_types = {}
+
+    gmsh.option.setNumber("Mesh.Algorithm",               8)
+    gmsh.option.setNumber("Mesh.RecombineAll",            0)  # handled per-surface below
     gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size_min)
     gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size_max)
+
+    # Per-surface mesh type
+    for surf_tag in sorted(included):
+        mtype = mesh_types.get(surf_tag, "quad")
+        if mtype == "structured":
+            try:
+                boundary = gmsh.model.getBoundary([(2, surf_tag)], oriented=False)
+                for _, ctag in boundary:
+                    ctag = abs(ctag)
+                    try:
+                        length = float(gmsh.model.occ.getMass(1, ctag))
+                        n_pts  = max(3, round(length / mesh_size_max) + 1)
+                    except Exception:
+                        n_pts = 5
+                    gmsh.model.mesh.setTransfiniteCurve(ctag, n_pts)
+                gmsh.model.mesh.setTransfiniteSurface(surf_tag)
+                gmsh.model.mesh.setRecombine(2, surf_tag)
+            except Exception as exc:
+                print(f"  WARNING: structured failed for surf {surf_tag}: {exc}; using quad")
+                gmsh.model.mesh.setRecombine(2, surf_tag)
+        elif mtype == "tri":
+            gmsh.model.mesh.setAlgorithm(2, surf_tag, 6)
+        else:  # "quad"
+            gmsh.model.mesh.setRecombine(2, surf_tag)
 
     gmsh.model.mesh.generate(2)
     gmsh.model.mesh.recombine()
@@ -102,18 +130,26 @@ def run_mesh(step_file: str, face_labels: dict, mesh_file: str,
             counts = {et: len(etags) for et, etags in zip(elem_types, elem_tags)}
             n_quad = counts.get(ETYPE_QUAD, 0)
             n_tri  = counts.get(ETYPE_TRI,  0)
-            total  = n_quad + n_tri
-            pct    = 100.0 * n_quad / total if total else 0.0
-            ok     = "✓" if n_quad > 0 else "✗ NO QUADS"
-            if n_quad == 0:
+            mtype  = mesh_types.get(surf_tag, "quad")
+            if mtype == "tri":
+                ok_flag = n_tri > 0
+                ok      = "✓" if ok_flag else "✗ NO TRIS"
+                print(f"  {name:14s} surf {surf_tag:3d}  tris={n_tri:4d}  [{mtype}]  {ok}")
+            else:
+                total   = n_quad + n_tri
+                pct     = 100.0 * n_quad / total if total else 0.0
+                ok_flag = n_quad > 0
+                ok      = "✓" if ok_flag else "✗ NO QUADS"
+                print(f"  {name:14s} surf {surf_tag:3d}  quads={n_quad:4d}  tris={n_tri:3d}  "
+                      f"quad%={pct:5.1f}%  [{mtype}]  {ok}")
+            if not ok_flag:
                 all_ok = False
-            print(f"  {name:14s} surf {surf_tag:3d}  quads={n_quad:4d}  tris={n_tri:3d}  quad%={pct:5.1f}%  {ok}")
 
     gmsh.finalize()
 
     if not all_ok:
-        raise RuntimeError("One or more surfaces produced no quad elements.")
-    print("\nPASS: all named surfaces have quad elements.")
+        raise RuntimeError("One or more surfaces produced no expected elements.")
+    print("\nPASS: all named surfaces have mesh elements.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

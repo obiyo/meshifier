@@ -172,6 +172,9 @@ pl.camera_position = "iso"
 # Mesh actors (view phase) — populated after first Run Mesh
 mesh_actors: list = []
 
+# Per-surface mesh algorithm (not in trame state — avoids dict-key serialization issues)
+mesh_types: dict[int, str] = {}  # surf_tag → "quad" | "structured" | "tri"
+
 # ── App state ─────────────────────────────────────────────────────────────────
 state.app_phase       = "label"             # "label" | "view"
 state.selected_surf   = None
@@ -190,6 +193,7 @@ state.has_groups      = False
 state.surf_chips      = []
 state.mesh_size       = round(mesh_sz, 1)
 state.mesh_stats      = ""
+state.sel_mesh_type   = "quad"
 
 _SLIDER_MAX = round(bb_diag / 3, 1)
 _SLIDER_MIN = 0.5
@@ -230,9 +234,10 @@ def _build_chips() -> list:
             suffix = " ✓"
         else:
             suffix = ""
+        type_badge = {"structured": " (S)", "tri": " (T)"}.get(mesh_types.get(tag, "quad"), "")
         chips.append({
             "tag":        tag,
-            "label":      f"Surf {tag}{suffix}",
+            "label":      f"Surf {tag}{suffix}{type_badge}",
             "color":      hex_color,
             "text_color": text_color,
         })
@@ -244,6 +249,15 @@ def _refresh_colors():
         actor.GetProperty().SetColor(*_face_color_rgb(surf_tag))
     state.surf_chips = _build_chips()
     ctrl.view_update()
+
+
+@state.change("sel_mesh_type")
+def _on_mesh_type_change(sel_mesh_type, **kwargs):
+    tag = state.selected_surf
+    if tag is None:
+        return
+    mesh_types[tag] = sel_mesh_type
+    state.surf_chips = _build_chips()
 
 
 def _sync_group_state():
@@ -264,11 +278,12 @@ def _update_sel_display(surf_tag: int):
         status = "included (unassigned)"
     else:
         status = "excluded"
-    state.sel_surf_text = f"surf {surf_tag}"
-    state.sel_centroid  = info.get("centroid", "—")
-    state.sel_area      = str(info.get("area", "—"))
-    state.sel_status    = status
-    state.has_selection = True
+    state.sel_surf_text  = f"surf {surf_tag}"
+    state.sel_centroid   = info.get("centroid", "—")
+    state.sel_area       = str(info.get("area", "—"))
+    state.sel_status     = status
+    state.sel_mesh_type  = mesh_types.get(surf_tag, "quad")
+    state.has_selection  = True
 
 # ── Phase visibility toggles ──────────────────────────────────────────────────
 def _set_tess_visible(on: bool):
@@ -293,35 +308,43 @@ def _build_mesh_actors(mesh_file: str, group_order: list) -> tuple:
         if v[1] == 2
     }
     phys_tags = mesh.cell_data.get("gmsh:physical", [])
-    quad_conn, quad_label = [], []
+    # Collect quads and triangles together; build per-element connectivity list
+    elem_nodes_list, elem_type_list, elem_label_list = [], [], []
+    VTK_QUAD, VTK_TRI = 9, 5
+    n_quads = n_tris = 0
     for block, cell_tags in zip(mesh.cells, phys_tags):
-        if block.type != "quad":
-            continue
-        for row, tag in zip(block.data, cell_tags):
-            quad_conn.append(row)
-            quad_label.append(int(tag))
+        if block.type == "quad":
+            for row, tag in zip(block.data, cell_tags):
+                elem_nodes_list.append(row)
+                elem_type_list.append(VTK_QUAD)
+                elem_label_list.append(int(tag))
+            n_quads += len(block.data)
+        elif block.type == "triangle":
+            for row, tag in zip(block.data, cell_tags):
+                elem_nodes_list.append(row)
+                elem_type_list.append(VTK_TRI)
+                elem_label_list.append(int(tag))
+            n_tris += len(block.data)
 
-    if not quad_conn:
-        return [], "No quad elements found"
+    if not elem_nodes_list:
+        return [], "No surface elements found"
 
-    quad_conn  = np.array(quad_conn,  dtype=np.int64)
-    quad_label = np.array(quad_label, dtype=np.int32)
-    points     = mesh.points[:, :3]
+    points      = mesh.points[:, :3]
+    elem_labels = np.array(elem_label_list, dtype=np.int32)
+    elem_types  = np.array(elem_type_list,  dtype=np.uint8)
 
-    VTK_QUAD = 9
-    n     = len(quad_conn)
-    cells = np.empty(n * 5, dtype=np.int64)
-    cells[0::5] = 4
-    cells[1::5] = quad_conn[:, 0]
-    cells[2::5] = quad_conn[:, 1]
-    cells[3::5] = quad_conn[:, 2]
-    cells[4::5] = quad_conn[:, 3]
+    # Build VTK cell array (variable-length: 4 ints per quad, 3 ints per tri)
+    cell_parts = []
+    for row, vtype in zip(elem_nodes_list, elem_type_list):
+        cell_parts.append(len(row))
+        cell_parts.extend(row)
+    cells_arr = np.array(cell_parts, dtype=np.int64)
 
-    grid = pv.UnstructuredGrid(cells, np.full(n, VTK_QUAD, dtype=np.uint8), points)
-    grid.cell_data["region_id"] = quad_label
+    grid = pv.UnstructuredGrid(cells_arr, elem_types, points)
+    grid.cell_data["region_id"] = elem_labels
 
     new_actors = []
-    for tag in np.unique(quad_label):
+    for tag in np.unique(elem_labels):
         name = tag_to_name.get(int(tag), f"tag_{tag}")
         try:
             idx = group_order.index(name)
@@ -329,7 +352,7 @@ def _build_mesh_actors(mesh_file: str, group_order: list) -> tuple:
             idx = int(tag) % 10
         color_rgb = group_color_rgb(idx)
         color_255 = [int(c * 255) for c in color_rgb]
-        subset = grid.extract_cells(quad_label == tag)
+        subset = grid.extract_cells(elem_labels == tag)
         actor  = pl.add_mesh(
             subset,
             color=color_255,
@@ -338,10 +361,15 @@ def _build_mesh_actors(mesh_file: str, group_order: list) -> tuple:
             line_width=1.0,
             show_scalar_bar=False,
         )
-        actor.SetVisibility(False)  # shown only in view phase
+        actor.SetVisibility(False)
         new_actors.append(actor)
 
-    stats = f"{len(quad_conn)} quads  ·  {len(np.unique(quad_label))} regions"
+    parts = []
+    if n_quads:
+        parts.append(f"{n_quads} quads")
+    if n_tris:
+        parts.append(f"{n_tris} tris")
+    stats = "  ·  ".join(parts) + f"  ·  {len(np.unique(elem_labels))} regions"
     return new_actors, stats
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────
@@ -396,14 +424,33 @@ def assign_group():
 
 def export_json():
     data = {
-        "included": list(state.included),
-        "groups":   {name: list(tags) for name, tags in state.groups.items()},
+        "included":   list(state.included),
+        "groups":     {name: list(tags) for name, tags in state.groups.items()},
+        "mesh_types": {str(k): v for k, v in mesh_types.items() if v != "quad"},
     }
     with open(str(JSON_PATH), "w") as f:
         json.dump(data, f, indent=2)
     state.status_msg = f"Saved → {JSON_PATH.name}"
     print(f"\nExported: {JSON_PATH}")
     print(json.dumps(data, indent=2))
+
+
+def load_json():
+    if not JSON_PATH.exists():
+        state.status_msg = f"Not found: {JSON_PATH.name}"
+        return
+    with open(JSON_PATH) as f:
+        data = json.load(f)
+    state.included = data.get("included", [])
+    state.groups   = data.get("groups",   {})
+    mesh_types.clear()
+    mesh_types.update({int(k): v for k, v in data.get("mesh_types", {}).items()})
+    _sync_group_state()
+    # Restore selected surface's type display if still selected
+    if state.selected_surf is not None:
+        state.sel_mesh_type = mesh_types.get(state.selected_surf, "quad")
+    _refresh_colors()
+    state.status_msg = f"Loaded {JSON_PATH.name}"
 
 
 def run_mesh_action():
@@ -426,7 +473,8 @@ def run_mesh_action():
     try:
         run_mesh(str(STEP_PATH), data, MESH_FILE,
                  mesh_size_max=mesh_size,
-                 mesh_size_min=mesh_size * 0.4)
+                 mesh_size_min=mesh_size * 0.4,
+                 mesh_types=dict(mesh_types))
     except Exception as e:
         state.status_msg = f"Mesh failed: {e}"
         import traceback; traceback.print_exc()
@@ -453,6 +501,21 @@ def edit_labels():
     state.app_phase  = "label"
     state.status_msg = "Edit groups, then Run Mesh again."
     ctrl.view_update()
+
+# ── Auto-load labels JSON if it exists alongside the STEP file ───────────────
+if JSON_PATH.exists():
+    try:
+        with open(JSON_PATH) as _f:
+            _saved = json.load(_f)
+        state.included = _saved.get("included", [])
+        state.groups   = _saved.get("groups",   {})
+        mesh_types.update({int(k): v for k, v in _saved.get("mesh_types", {}).items()})
+        _sync_group_state()
+        for _tag, _actor in actors.items():
+            _actor.GetProperty().SetColor(*_face_color_rgb(_tag))
+        print(f"  Auto-loaded labels from {JSON_PATH.name}")
+    except Exception as _e:
+        print(f"  Could not auto-load {JSON_PATH.name}: {_e}")
 
 # ── Pre-populate chips before layout ─────────────────────────────────────────
 state.surf_chips = _build_chips()
@@ -527,7 +590,7 @@ with SinglePageLayout(server) as layout:
                                     )
 
                         # Include / Exclude
-                        with v.VRow(no_gutters=True, classes="mb-3"):
+                        with v.VRow(no_gutters=True, classes="mb-2"):
                             with v.VCol(cols=6, classes="pr-1"):
                                 v.VBtn(
                                     "Include", block=True, color="primary",
@@ -542,6 +605,26 @@ with SinglePageLayout(server) as layout:
                                     disabled=("!has_selection",),
                                     click=exclude_face,
                                 )
+
+                        # Mesh type toggle (only shown when a surface is selected)
+                        with html.Div(v_if="has_selection",
+                                      style="margin-bottom:12px"):
+                            html.P("Mesh type",
+                                   style="font-size:0.78em; color:#555; margin:4px 0 4px 0")
+                            with v.VBtnToggle(
+                                v_model=("sel_mesh_type", "quad"),
+                                density="compact",
+                                variant="outlined",
+                                color="primary",
+                                mandatory=True,
+                                style="width:100%",
+                            ):
+                                v.VBtn("Quad",   value="quad",       size="x-small",
+                                       style="flex:1")
+                                v.VBtn("Struct", value="structured", size="x-small",
+                                       style="flex:1")
+                                v.VBtn("Tri",    value="tri",        size="x-small",
+                                       style="flex:1")
 
                         v.VDivider(classes="mb-3")
 
@@ -594,13 +677,21 @@ with SinglePageLayout(server) as layout:
                             classes="mb-3",
                         )
 
-                        # Export / Mesh
-                        v.VBtn(
-                            "Export JSON", block=True, color="primary",
-                            variant="tonal", classes="mb-2",
-                            disabled=("!has_groups",),
-                            click=export_json,
-                        )
+                        # Export / Load / Mesh
+                        with v.VRow(no_gutters=True, classes="mb-2"):
+                            with v.VCol(cols=6, classes="pr-1"):
+                                v.VBtn(
+                                    "Export JSON", block=True, color="primary",
+                                    variant="tonal", size="small",
+                                    disabled=("!has_groups",),
+                                    click=export_json,
+                                )
+                            with v.VCol(cols=6, classes="pl-1"):
+                                v.VBtn(
+                                    "Load JSON", block=True, color="default",
+                                    variant="outlined", size="small",
+                                    click=load_json,
+                                )
                         v.VBtn(
                             "Run Mesh", block=True, color="secondary",
                             variant="tonal", classes="mb-2",
