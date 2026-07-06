@@ -525,7 +525,7 @@ def _build_mesh_actors(mesh_file: str, group_orders: dict) -> tuple:
             if btype in ("quad", "triangle"):
                 kw.update(show_edges=True, edge_color="black", line_width=1.0)
             elif btype == "line":
-                kw["line_width"] = 4.0
+                kw.update(line_width=4.0, render_lines_as_tubes=True)
             else:  # vertex
                 kw.update(point_size=14, render_points_as_spheres=True)
             actor = pl.add_mesh(subset, **kw)
