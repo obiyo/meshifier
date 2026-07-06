@@ -60,7 +60,7 @@ print(f"\nLoading {STEP_PATH.name} ...")
 gmsh.initialize()
 gmsh.option.setNumber("General.Verbosity", 0)
 gmsh.model.add("labeler")
-gmsh.model.occ.importShapes(str(STEP_PATH))
+gmsh.model.occ.importShapes(str(STEP_PATH), highestDimOnly=False)
 gmsh.model.occ.synchronize()
 
 vertices = gmsh.model.getEntities(dim=0)
@@ -98,10 +98,13 @@ for _, tag in edges:
         length = float(gmsh.model.occ.getMass(1, tag))
     except Exception:
         length = 0.0
+    # Free bars have no bounding surface (upward adjacency count == 0)
+    is_free = len(gmsh.model.getAdjacencies(1, tag)[0]) == 0
     edge_info[tag] = {
         "center_xyz": (cx, cy, cz),
         "center":     f"({cx:.2f}, {cy:.2f}, {cz:.2f})",
         "length":     round(length, 3),
+        "is_free":    is_free,
     }
 
 # ── Vertex info (getBoundingBox — getCenterOfMass returns 0,0,0 for dim=0) ───
@@ -265,6 +268,7 @@ state.sel_edge_text      = "—"
 state.sel_edge_center    = "—"
 state.sel_edge_length    = "—"
 state.sel_edge_status    = "—"
+state.sel_edge_type      = "—"   # "free bar" | "solid boundary"
 state.has_edge_sel       = False
 state.has_edge_groups    = False
 state.edge_chips         = []
@@ -370,8 +374,9 @@ def _update_surf_display(tag: int):
 
 # ── Edge helpers ──────────────────────────────────────────────────────────────
 def _build_edge_chips() -> list:
+    badges = {tag: " (bar)" if edge_info[tag]["is_free"] else "" for tag in edge_tags}
     return _build_entity_chips(edge_tags, state.edge_included, state.edge_groups,
-                                state.selected_edge)
+                                state.selected_edge, badges)
 
 
 def _refresh_edge_colors():
@@ -400,6 +405,7 @@ def _update_edge_display(tag: int):
     state.sel_edge_center = info.get("center", "—")
     state.sel_edge_length = str(info.get("length", "—"))
     state.sel_edge_status = status
+    state.sel_edge_type   = "free bar" if info.get("is_free") else "solid boundary"
     state.has_edge_sel    = True
 
 # ── Vertex helpers ────────────────────────────────────────────────────────────
@@ -974,6 +980,7 @@ with SinglePageLayout(server) as layout:
                             group_summary_state="edge_group_summary",
                             sel_info_lines=[
                                 ("ID",     "sel_edge_text"),
+                                ("Type",   "sel_edge_type"),
                                 ("Center", "sel_edge_center"),
                                 ("Length", "sel_edge_length"),
                                 ("Status", "sel_edge_status"),

@@ -110,6 +110,29 @@ x, y, z = bb[0], bb[1], bb[2]
 
 ---
 
+### 16. `importShapes` drops free edges unless `highestDimOnly=False`
+
+`gmsh.model.occ.importShapes(file)` defaults to `highestDimOnly=True`, which imports only the highest-dimensional entities in the file. For a STEP compound containing a solid plus standalone wire/edge elements, this silently discards all the free edges — only the solid appears.
+
+**Fix:** Always pass `highestDimOnly=False` when the STEP file may contain lower-dimensional entities:
+```python
+gmsh.model.occ.importShapes(step_file, highestDimOnly=False)
+```
+This has no downside for pure-solid files.
+
+---
+
+### 17. Detecting free bar edges (no bounding surface) via adjacency
+
+After importing with `highestDimOnly=False`, use upward adjacency to distinguish free bar edges from solid-bounding edges:
+```python
+adj = gmsh.model.getAdjacencies(1, tag)  # returns (upward, downward)
+is_free_bar = len(adj[0]) == 0           # adj[0] = bounding surfaces (empty for free bars)
+```
+Note: `adj[1]` is the downward adjacency (endpoint vertices, always 2 for a line), NOT the surfaces. Easy to confuse.
+
+---
+
 ### 15. meshio cell type names for 0D / 1D elements
 
 After reading a `.msh` file with meshio, lower-dimensional elements appear as:

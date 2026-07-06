@@ -69,7 +69,7 @@ def run_mesh(step_file: str, face_labels: dict, mesh_file: str,
     gmsh.initialize()
     gmsh.option.setNumber("General.Verbosity", 2)
     gmsh.model.add("part")
-    gmsh.model.occ.importShapes(step_file)
+    gmsh.model.occ.importShapes(step_file, highestDimOnly=False)
     gmsh.model.occ.synchronize()
 
     # Named physical groups from user assignments
@@ -187,63 +187,116 @@ if __name__ == "__main__":
     MESH_FILE = "part.msh"
     CENTROID_TOL = 0.5
 
-    # Build L-shaped extrusion
-    pts = [(0, 0), (20, 0), (20, 10), (10, 10), (10, 20), (0, 20)]
+    # ── Build L-shaped plate ──────────────────────────────────────────────────
+    pts   = [(0, 0), (20, 0), (20, 10), (10, 10), (10, 20), (0, 20)]
     solid = cq.Workplane("XY").polyline(pts).close().extrude(5)
 
+    # ── Standalone bar members (portal frame above the plate) ─────────────────
+    # These are NOT bounding edges of any surface — they become 1D bar elements.
+    #
+    #   z=12  (0,0,12)────────(20,0,12)
+    #          │                        (beams)
+    #          │(0,20,12)
+    #          │
+    #   z=5   post0  post1  post2       (at L-shape corners)
+    #          │      │      │
+    #          └──────┴──────┘  (L-plate top face)
+    #
+    bars = [
+        cq.Edge.makeLine(cq.Vector( 0,  0, 5), cq.Vector( 0,  0, 12)),  # post
+        cq.Edge.makeLine(cq.Vector(20,  0, 5), cq.Vector(20,  0, 12)),  # post
+        cq.Edge.makeLine(cq.Vector( 0, 20, 5), cq.Vector( 0, 20, 12)),  # post
+        cq.Edge.makeLine(cq.Vector( 0,  0, 12), cq.Vector(20,  0, 12)), # beam
+        cq.Edge.makeLine(cq.Vector( 0,  0, 12), cq.Vector( 0, 20, 12)), # beam
+    ]
+
+    # Export solid + free bars together as an OCC compound
+    compound = cq.Compound.makeCompound([solid.val()] + bars)
+    cq.exporters.export(compound, STEP_FILE)
+    print(f"\nExported → {STEP_FILE}  (solid + {len(bars)} free bar edges)")
+
+    # ── Match Gmsh surface and edge tags ──────────────────────────────────────
     def cq_centroid(face):
         c = face.Center()
         return np.array([c.x, c.y, c.z])
 
-    all_faces = solid.faces().vals()
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Verbosity", 0)
+    gmsh.model.add("match")
+    # highestDimOnly=False is required to import free edges alongside the solid
+    gmsh.model.occ.importShapes(STEP_FILE, highestDimOnly=False)
+    gmsh.model.occ.synchronize()
 
+    gm_surfaces = gmsh.model.getEntities(dim=2)
+    gm_edges    = gmsh.model.getEntities(dim=1)
+
+    surf_centroids = {
+        tag: np.array(gmsh.model.occ.getCenterOfMass(2, tag))
+        for _, tag in gm_surfaces
+    }
+    edge_centers = {
+        tag: np.array(gmsh.model.occ.getCenterOfMass(1, tag))
+        for _, tag in gm_edges
+    }
+    # Free bars have no bounding surface (upward adjacency count == 0)
+    free_edge_tags = {
+        tag for _, tag in gm_edges
+        if len(gmsh.model.getAdjacencies(1, tag)[0]) == 0
+    }
+    gmsh.finalize()
+
+    print(f"\nGmsh: {len(gm_surfaces)} surfaces, {len(gm_edges)} edges "
+          f"({len(free_edge_tags)} free bars)")
+
+    # Match surface centroids
     FACE_TARGETS = {
         "top":        (8.33, 8.33, 5.0),
         "right_wall": (20.0,  5.0,  2.5),
         "step_face":  (15.0, 10.0,  2.5),
     }
+    unmatched_surfs = set(t for _, t in gm_surfaces)
+    surf_groups: dict[str, list[int]] = {}
+    surf_included: list[int] = []
 
-    tagged_cq = {
-        name: min(all_faces, key=lambda f: np.linalg.norm(cq_centroid(f) - np.array(xyz)))
-        for name, xyz in FACE_TARGETS.items()
-    }
-    tag_centroids = {name: cq_centroid(f) for name, f in tagged_cq.items()}
-
-    print("CadQuery tagged-face centroids:")
-    for name, c in tag_centroids.items():
-        print(f"  {name:12s}  ({c[0]:.3f}, {c[1]:.3f}, {c[2]:.3f})")
-
-    cq.exporters.export(solid, STEP_FILE)
-    print(f"\nExported → {STEP_FILE}")
-
-    # Match CadQuery centroids to Gmsh surface tags
-    gmsh.initialize()
-    gmsh.option.setNumber("General.Verbosity", 0)
-    gmsh.model.add("match")
-    gmsh.model.occ.importShapes(STEP_FILE)
-    gmsh.model.occ.synchronize()
-
-    surfaces = gmsh.model.getEntities(dim=2)
-    surf_centroids = {
-        tag: np.array(gmsh.model.occ.getCenterOfMass(2, tag))
-        for _, tag in surfaces
-    }
-    gmsh.finalize()
-
-    print(f"\nGmsh found {len(surfaces)} surfaces")
-    unmatched = set(t for _, t in surfaces)
-    groups: dict[str, list[int]] = {}
-    included: list[int] = []
-
-    for face_name, ref_c in tag_centroids.items():
-        best = min(unmatched, key=lambda t: np.linalg.norm(surf_centroids[t] - ref_c))
-        dist = np.linalg.norm(surf_centroids[best] - ref_c)
+    print("\nSurface matching:")
+    for face_name, ref_c in FACE_TARGETS.items():
+        ref = np.array(ref_c)
+        best = min(unmatched_surfs, key=lambda t: np.linalg.norm(surf_centroids[t] - ref))
+        dist = np.linalg.norm(surf_centroids[best] - ref)
         if dist > CENTROID_TOL:
             print(f"  WARNING: {face_name} match dist={dist:.4f}", file=sys.stderr)
-        groups[face_name] = [best]
-        included.append(best)
-        unmatched.discard(best)
+        surf_groups[face_name] = [best]
+        surf_included.append(best)
+        unmatched_surfs.discard(best)
         print(f"  {face_name:12s} → surf {best}  (dist={dist:.5f})")
 
-    face_labels = {"included": included, "groups": groups}
+    # Match bar edge centroids (group posts and beams separately)
+    BAR_TARGETS = {
+        "frame_post": [(0, 0, 8.5), (20, 0, 8.5), (0, 20, 8.5)],
+        "frame_beam": [(10, 0, 12), (0, 10, 12)],
+    }
+    unmatched_bars = set(free_edge_tags)
+    edge_groups_map: dict[str, list[int]] = {}
+    edge_included: list[int] = []
+
+    print("\nFree bar matching:")
+    for group_name, centers in BAR_TARGETS.items():
+        edge_groups_map[group_name] = []
+        for ref_c in centers:
+            ref = np.array(ref_c)
+            best = min(unmatched_bars,
+                       key=lambda t: np.linalg.norm(edge_centers[t] - ref))
+            dist = np.linalg.norm(edge_centers[best] - ref)
+            edge_groups_map[group_name].append(best)
+            edge_included.append(best)
+            unmatched_bars.discard(best)
+            print(f"  {group_name:14s} → edge {best}  center={tuple(edge_centers[best].round(1))}  "
+                  f"(dist={dist:.5f})")
+
+    face_labels = {
+        "included":      surf_included,
+        "groups":        surf_groups,
+        "edge_included": edge_included,
+        "edge_groups":   edge_groups_map,
+    }
     run_mesh(STEP_FILE, face_labels, MESH_FILE)
